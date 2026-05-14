@@ -1,53 +1,73 @@
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::{Fill, Order, OrderBookSnapshot, PriceLevel, Side};
 
-// One side of the book (bids or asks).
-// levels: sparse BTreeMap — only active price ticks exist as keys.
-// best:   cached best price for O(1) top-of-book peek instead of
-//         O(log n) BTreeMap min/max on every match iteration.
-#[derive(Debug)]
-struct HalfBook {
-    levels: BTreeMap<u64, VecDeque<Order>>,
-    best: Option<u64>,
-    side: Side,
+// Encoding the traversal direction into the BTreeMap key type eliminates all
+// per-side branching.  keys().next() and .iter() work uniformly for both sides:
+//
+//   AskBook  u64          → natural ascending  = lowest ask first
+//   BidBook  Reverse<u64> → natural ascending  = highest bid first
+
+trait PriceKey: Ord + Copy + std::fmt::Debug {
+    fn encode(price: u64) -> Self;
+    fn decode(self) -> u64;
 }
 
-impl HalfBook {
-    fn new(side: Side) -> Self {
-        Self { levels: BTreeMap::new(), best: None, side }
+impl PriceKey for u64 {
+    fn encode(p: u64) -> u64    { p }
+    fn decode(self)   -> u64    { self }
+}
+
+impl PriceKey for Reverse<u64> {
+    fn encode(p: u64)  -> Self  { Reverse(p) }
+    fn decode(self)    -> u64   { self.0 }
+}
+
+// VecDeque per level — O(1) pop_front, no element shifting.
+//
+// Free-list pool (self.free): when a level drains, its VecDeque is cleared and
+// returned to the pool rather than dropped.  The next new level pops from the
+// pool instead of allocating fresh.  This eliminates the alloc/dealloc cycle
+// that dominated earlier flamegraphs:
+//
+//   03.svg (raw VecDeque): dealloc 30% + __bzero 22% = 52% allocator overhead
+//   04.svg (SmallVec):     dealloc 21% + memmove 24% = 45% — swapped one cost
+//                          for another: remove(0) shifts all elements
+//   05.svg (pool):         dealloc and memmove should both disappear
+
+#[derive(Debug)]
+struct HalfBook<K: PriceKey> {
+    levels: BTreeMap<K, VecDeque<Order>>,
+    free:   Vec<VecDeque<Order>>,   // recycled empty queues
+    best:   Option<u64>,
+}
+
+impl<K: PriceKey> HalfBook<K> {
+    fn new() -> Self {
+        Self { levels: BTreeMap::new(), free: Vec::new(), best: None }
     }
 
-    // Does the resting best price cross the incoming taker limit?
-    // O(1) — reads cached best.
-    fn crosses(&self, taker_limit: u64) -> bool {
-        match (self.best, self.side) {
-            // Asks: resting sell crosses a buy when ask_price <= buy_limit
-            (Some(best), Side::Sell) => best <= taker_limit,
-            // Bids: resting buy crosses a sell when bid_price >= sell_limit
-            (Some(best), Side::Buy) => best >= taker_limit,
-            (None, _) => false,
-        }
-    }
-
-    // Peek at the front order of the best level without mutating. O(1).
+    // O(1) via cached best + one BTreeMap::get.
     fn peek_best(&self) -> Option<(u64, u64, u64)> {
-        let best = self.best?;
-        let front = self.levels.get(&best)?.front()?;
-        Some((best, front.id, front.qty))
+        let price = self.best?;
+        let front = self.levels.get(&K::encode(price))?.front()?;
+        Some((price, front.id, front.qty))
     }
 
-    // Deduct `qty` from the front order at the best price level.
-    // Removes the order if fully filled; removes the price level if empty;
-    // updates the cached best pointer. O(1) amortised.
+    // Deduct qty from the front order at the best level.
+    // pop_front is O(1) — VecDeque ring buffer, no shifting.
+    // Level pruning is O(log n) but only on exhaustion.
+    // Drained VecDeque goes to pool — no heap free.
     fn consume(&mut self, qty: u64) {
-        let best = match self.best {
-            Some(b) => b,
-            None => return,
+        let price = match self.best {
+            Some(p) => p,
+            None    => return,
         };
-        let queue = match self.levels.get_mut(&best) {
+        let key   = K::encode(price);
+        let queue = match self.levels.get_mut(&key) {
             Some(q) => q,
-            None => return,
+            None    => return,
         };
         if let Some(front) = queue.front_mut() {
             front.qty -= qty;
@@ -56,52 +76,51 @@ impl HalfBook {
             }
         }
         if queue.is_empty() {
-            self.levels.remove(&best);
-            // O(log n) only when a level is exhausted, not on every fill.
-            self.best = match self.side {
-                Side::Buy  => self.levels.keys().next_back().copied(),
-                Side::Sell => self.levels.keys().next().copied(),
-            };
+            // Remove from map and recycle the allocation instead of dropping.
+            let mut recycled = self.levels.remove(&key).unwrap();
+            recycled.clear();           // drop elements, keep capacity
+            self.free.push(recycled);
+            self.best = self.levels.keys().next().copied().map(K::decode);
         }
     }
 
-    // Rest an unmatched (or partially matched) order at its price level.
-    // O(log n) for BTreeMap insert; O(1) best update.
+    // Rest an order.  New levels pull from the pool — no malloc.
     fn rest(&mut self, order: Order) {
         let price = order.price;
-        self.levels.entry(price).or_default().push_back(order);
-        self.best = Some(match self.side {
-            Side::Buy  => self.best.map_or(price, |b| b.max(price)),
-            Side::Sell => self.best.map_or(price, |b| b.min(price)),
+        let key   = K::encode(price);
+        let queue = self.levels.entry(key).or_insert_with(|| {
+            self.free.pop().unwrap_or_default()
+        });
+        queue.push_back(order);
+        self.best = Some(match self.best {
+            None    => price,
+            Some(b) => if key < K::encode(b) { price } else { b },
         });
     }
 
     fn snapshot_levels(&self) -> Vec<PriceLevel> {
-        match self.side {
-            Side::Buy => self.levels.iter().rev()
-                .map(|(&price, q)| PriceLevel { price, qty: q.iter().map(|o| o.qty).sum() })
-                .collect(),
-            Side::Sell => self.levels.iter()
-                .map(|(&price, q)| PriceLevel { price, qty: q.iter().map(|o| o.qty).sum() })
-                .collect(),
-        }
+        self.levels.iter()
+            .map(|(k, queue)| PriceLevel {
+                price: k.decode(),
+                qty:   queue.iter().map(|o| o.qty).sum(),
+            })
+            .collect()
     }
 }
 
+type BidBook = HalfBook<Reverse<u64>>;
+type AskBook = HalfBook<u64>;
+
 #[derive(Debug)]
 pub struct OrderBook {
-    bids: HalfBook,
-    asks: HalfBook,
+    bids: BidBook,
+    asks: AskBook,
     next_id: u64,
 }
 
 impl OrderBook {
     pub fn new() -> Self {
-        Self {
-            bids: HalfBook::new(Side::Buy),
-            asks: HalfBook::new(Side::Sell),
-            next_id: 1,
-        }
+        Self { bids: HalfBook::new(), asks: HalfBook::new(), next_id: 1 }
     }
 
     pub fn next_id(&mut self) -> u64 {
@@ -110,52 +129,47 @@ impl OrderBook {
         id
     }
 
-    // Match and rest a taker order. Returns every fill produced.
-    // Requires &mut self — the caller holds a tokio::sync::Mutex<OrderBook>
-    // and must acquire it before calling here, serialising all submissions.
+    // Requires &mut self — caller holds tokio::sync::Mutex<OrderBook>.
     pub fn submit(&mut self, mut taker: Order) -> Vec<Fill> {
-        let mut fills = Vec::new();
+        let mut fills = Vec::with_capacity(4);
 
         match taker.side {
             Side::Buy => {
-                while taker.qty > 0 && self.asks.crosses(taker.price) {
-                    // Read maker state before mutably borrowing asks.consume()
-                    let (ask_price, maker_id, maker_qty) =
-                        self.asks.peek_best().unwrap();
+                while taker.qty > 0 {
+                    let Some((ask_price, maker_id, maker_qty)) = self.asks.peek_best()
+                    else { break };
+                    if ask_price > taker.price { break }
 
                     let fill_qty = taker.qty.min(maker_qty);
                     fills.push(Fill {
                         maker_order_id: maker_id,
                         taker_order_id: taker.id,
                         price: ask_price,
-                        qty: fill_qty,
+                        qty:   fill_qty,
                     });
                     taker.qty -= fill_qty;
                     self.asks.consume(fill_qty);
                 }
-                if taker.qty > 0 {
-                    self.bids.rest(taker);
-                }
+                if taker.qty > 0 { self.bids.rest(taker); }
             }
 
             Side::Sell => {
-                while taker.qty > 0 && self.bids.crosses(taker.price) {
-                    let (bid_price, maker_id, maker_qty) =
-                        self.bids.peek_best().unwrap();
+                while taker.qty > 0 {
+                    let Some((bid_price, maker_id, maker_qty)) = self.bids.peek_best()
+                    else { break };
+                    if bid_price < taker.price { break }
 
                     let fill_qty = taker.qty.min(maker_qty);
                     fills.push(Fill {
                         maker_order_id: maker_id,
                         taker_order_id: taker.id,
                         price: bid_price,
-                        qty: fill_qty,
+                        qty:   fill_qty,
                     });
                     taker.qty -= fill_qty;
                     self.bids.consume(fill_qty);
                 }
-                if taker.qty > 0 {
-                    self.asks.rest(taker);
-                }
+                if taker.qty > 0 { self.asks.rest(taker); }
             }
         }
 
@@ -181,7 +195,7 @@ mod tests {
     #[test]
     fn no_match_when_spread_exists() {
         let mut book = OrderBook::new();
-        assert!(book.submit(order(1, Side::Buy,  99, 10)).is_empty());
+        assert!(book.submit(order(1, Side::Buy,  99,  10)).is_empty());
         assert!(book.submit(order(2, Side::Sell, 101, 10)).is_empty());
     }
 
@@ -192,7 +206,7 @@ mod tests {
         let fills = book.submit(order(2, Side::Sell, 100, 10));
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].price, 100);
-        assert_eq!(fills[0].qty, 10);
+        assert_eq!(fills[0].qty,   10);
         assert_eq!(fills[0].maker_order_id, 1);
         assert_eq!(fills[0].taker_order_id, 2);
         let snap = book.snapshot();
@@ -238,13 +252,46 @@ mod tests {
     }
 
     #[test]
+    fn bid_snapshot_is_highest_first() {
+        let mut book = OrderBook::new();
+        book.submit(order(1, Side::Buy, 99,  5));
+        book.submit(order(2, Side::Buy, 101, 5));
+        book.submit(order(3, Side::Buy, 100, 5));
+        let bids = book.snapshot().bids;
+        assert_eq!(bids[0].price, 101);
+        assert_eq!(bids[1].price, 100);
+        assert_eq!(bids[2].price, 99);
+    }
+
+    #[test]
+    fn ask_snapshot_is_lowest_first() {
+        let mut book = OrderBook::new();
+        book.submit(order(1, Side::Sell, 103, 5));
+        book.submit(order(2, Side::Sell, 101, 5));
+        book.submit(order(3, Side::Sell, 102, 5));
+        let asks = book.snapshot().asks;
+        assert_eq!(asks[0].price, 101);
+        assert_eq!(asks[1].price, 102);
+        assert_eq!(asks[2].price, 103);
+    }
+
+    #[test]
     fn best_pointer_updates_after_level_drained() {
         let mut book = OrderBook::new();
         book.submit(order(1, Side::Sell, 100, 5));
         book.submit(order(2, Side::Sell, 101, 5));
-        // Drain 100 level completely
-        book.submit(order(3, Side::Buy, 100, 5));
-        // Best ask should now be 101
+        book.submit(order(3, Side::Buy,  100, 5));
         assert_eq!(book.asks.best, Some(101));
+    }
+
+    #[test]
+    fn pool_reuses_queues() {
+        let mut book = OrderBook::new();
+        // Fill and drain a level, then refill it — pool should prevent reallocation
+        book.submit(order(1, Side::Buy,  100, 5));
+        book.submit(order(2, Side::Sell, 100, 5)); // drains bid level → pooled
+        assert_eq!(book.bids.free.len(), 1);       // one queue in pool
+        book.submit(order(3, Side::Buy,  100, 5)); // new bid → pulled from pool
+        assert_eq!(book.bids.free.len(), 0);       // pool consumed
     }
 }
