@@ -1,0 +1,38 @@
+services:
+  engine:
+    build:
+      context: .
+      target: engine
+    environment:
+      ENGINE_ADDR: "0.0.0.0:9000"
+    networks:
+      - eterna
+
+  api:
+    build:
+      context: .
+      target: api
+    environment:
+      ENGINE_URL:    "http://engine:9000"
+      ENGINE_WS_URL: "ws://engine:9000/ws"
+      API_ADDR:      "0.0.0.0:8080"
+    depends_on:
+      - engine
+    networks:
+      eterna:
+        aliases:
+          - api
+
+  nginx:
+    build: ./nginx
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+    networks:
+      - eterna
+
+networks:
+  eterna:
+    driver: bridge
+    name: eterna
