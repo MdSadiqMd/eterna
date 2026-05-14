@@ -9,52 +9,23 @@ use axum::{
     routing::{get, post},
 };
 use shared::{
-    Fill, Order, OrderBookSnapshot, Side, SubmitOrderReq, SubmitOrderResp,
+    Fill, Order, OrderBookSnapshot, SubmitOrderReq, SubmitOrderResp,
     orderbook::OrderBook,
 };
-use tokio::sync::{broadcast, mpsc, oneshot};
+use std::sync::Arc;
+use tokio::sync::{broadcast, Mutex};
 use tracing::info;
 
-
-// Engine actor — owns the order book; all mutations serialized via channel
-enum EngineCmd {
-    Submit {
-        side: Side,
-        price: u64,
-        qty: u64,
-        reply: oneshot::Sender<(u64, Vec<Fill>)>,
-    },
-    Snapshot {
-        reply: oneshot::Sender<OrderBookSnapshot>,
-    },
-}
-
-async fn engine_task(mut rx: mpsc::Receiver<EngineCmd>, fill_tx: broadcast::Sender<Fill>) {
-    let mut book = OrderBook::new();
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            EngineCmd::Submit { side, price, qty, reply } => {
-                let id = book.next_id();
-                let fills = book.submit(Order { id, side, price, qty });
-                for fill in &fills {
-                    let _ = fill_tx.send(fill.clone());
-                }
-                let _ = reply.send((id, fills));
-            }
-            EngineCmd::Snapshot { reply } => {
-                let _ = reply.send(book.snapshot());
-            }
-        }
-    }
-}
-
-
-// HTTP handlers
 type AppError = (StatusCode, String);
 
+// Arc<Mutex<OrderBook>> is the explicit serialisation point for all order
+// submissions. Every POST /orders — from any number of concurrent API server
+// instances — must acquire this lock before entering submit(). Two orders
+// can therefore never race inside the matching loop: double-matching is
+// structurally impossible because the lock must be held to mutate the book.
 #[derive(Clone)]
 struct AppState {
-    engine_tx: mpsc::Sender<EngineCmd>,
+    book:    Arc<Mutex<OrderBook>>,
     fill_tx: broadcast::Sender<Fill>,
 }
 
@@ -62,21 +33,24 @@ async fn post_orders(
     State(state): State<AppState>,
     Json(req): Json<SubmitOrderReq>,
 ) -> Result<Json<SubmitOrderResp>, AppError> {
-    let (tx, rx) = oneshot::channel();
-    state
-        .engine_tx
-        .send(EngineCmd::Submit {
-            side: req.side,
+    // Lock scope — acquire, assign ID, match, release.
+    // id and fills are moved out before the guard drops so the Mutex
+    // is never held across an .await (broadcast send below).
+    let (id, fills) = {
+        let mut book = state.book.lock().await;
+        let id    = book.next_id();
+        let fills = book.submit(Order {
+            id,
+            side:  req.side,
             price: req.price,
-            qty: req.qty,
-            reply: tx,
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            qty:   req.qty,
+        });
+        (id, fills)
+    }; // ← Mutex released here, before any async work
 
-    let (id, _fills) = rx
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    for fill in &fills {
+        let _ = state.fill_tx.send(fill.clone());
+    }
 
     Ok(Json(SubmitOrderResp { id }))
 }
@@ -84,22 +58,10 @@ async fn post_orders(
 async fn get_orderbook(
     State(state): State<AppState>,
 ) -> Result<Json<OrderBookSnapshot>, AppError> {
-    let (tx, rx) = oneshot::channel();
-    state
-        .engine_tx
-        .send(EngineCmd::Snapshot { reply: tx })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let snapshot = rx
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(snapshot))
+    let book = state.book.lock().await;
+    Ok(Json(book.snapshot()))
 }
 
-
-// WebSocket — streams Fill events to subscribers
 async fn ws_handler(
     State(state): State<AppState>,
     ws: WebSocketUpgrade,
@@ -117,7 +79,7 @@ async fn handle_ws(mut socket: WebSocket, mut fill_rx: broadcast::Receiver<Fill>
                 }
             }
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => break,
+            Err(broadcast::error::RecvError::Closed)    => break,
         }
     }
 }
@@ -130,18 +92,21 @@ async fn main() {
         )
         .init();
 
-    let (engine_tx, engine_rx) = mpsc::channel(1024);
     let (fill_tx, _) = broadcast::channel(1024);
 
-    let _engine = tokio::spawn(engine_task(engine_rx, fill_tx.clone()));
+    let state = AppState {
+        book:    Arc::new(Mutex::new(OrderBook::new())),
+        fill_tx,
+    };
 
-    let addr = std::env::var("ENGINE_ADDR").unwrap_or_else(|_| "0.0.0.0:9000".to_string());
+    let addr = std::env::var("ENGINE_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:9000".to_string());
 
     let app = Router::new()
-        .route("/orders", post(post_orders))
+        .route("/orders",    post(post_orders))
         .route("/orderbook", get(get_orderbook))
-        .route("/ws", get(ws_handler))
-        .with_state(AppState { engine_tx, fill_tx });
+        .route("/ws",        get(ws_handler))
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await
         .expect("failed to bind engine address");

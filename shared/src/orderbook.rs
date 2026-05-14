@@ -111,12 +111,8 @@ impl OrderBook {
     }
 
     // Match and rest a taker order. Returns every fill produced.
-    //
-    // Double-match safety: this method must only be called from the engine
-    // actor (engine/src/main.rs: engine_task). That actor processes one
-    // EngineCmd at a time via a single mpsc::Receiver — there is no concurrent
-    // access to this struct. Multiple API server instances all funnel orders
-    // through that single channel, so two orders can never race here.
+    // Requires &mut self — the caller holds a tokio::sync::Mutex<OrderBook>
+    // and must acquire it before calling here, serialising all submissions.
     pub fn submit(&mut self, mut taker: Order) -> Vec<Fill> {
         let mut fills = Vec::new();
 
